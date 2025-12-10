@@ -583,6 +583,304 @@ def tensor_network_1d_compress_dm(
         inplace,
     )
 
+def tensor_network_1d_compress_tm(
+    down_tn,
+    up_tn,
+    max_bond=None,
+    cutoff=1e-10,
+    down_site_tags=None,
+    up_site_tags=None,
+    normalize=False,
+    cutoff_mode="rsum1",
+    permute_arrays=True,
+    optimize="auto-hq",
+    sweep_reverse=False,
+    canonize=True,
+    equalize_norms=False,
+    inplace=False,
+    **compress_opts,
+):
+    """Compress a pair of down and up 1D-like tensor network 
+       using the 'transition matrix' method.
+
+    This method is used in: https://arxiv.org/abs/2505.09714
+
+    Parameters
+    ----------
+    down_tn : TensorNetwork
+        The down tensor network to compress. Every tensor should have exactly one of
+        the site tags. Each site can have multiple tensors and output indices.
+    up_tn : TensorNetwork
+        The up tensor network to compress. Every tensor should have exactly one of
+        the site tags. Each site can have multiple tensors and output indices.
+    max_bond : int
+        The maximum bond dimension to compress to.
+    cutoff : float, optional
+        The truncation error to use when compressing the tensor network.
+    down_site_tags : sequence of str, optional
+        The tags to use to group and order the tensors from ``down_tn``. If not
+        given, uses ``down_tn.site_tags``. The tensor network built will have one
+        tensor per site, in the order given by ``site_tags``.
+    normalize : bool, optional
+        Whether to normalize the final tensor network, making use of the fact
+        that the output tensor network is in right canonical form.
+    cutoff_mode : {"rsum1", "rel", ...}, optional
+        The mode to use when truncating the singular values of the decomposed
+        tensors. See :func:`~quimb.tensor.tensor_split`.
+    permute_arrays : bool or str, optional
+        Whether to permute the array indices of the final tensor network into
+        canonical order. If ``True`` will use the default order, otherwise if a
+        string this specifies a custom order.
+    optimize : str, optional
+        The contraction path optimizer to use.
+    sweep_reverse : bool, optional
+        Whether to sweep in the reverse direction, resulting in a left
+        canonical form instead of right canonical.
+    canonize : bool, optional
+        Dummy argument to match the signature of other compression methods.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
+    inplace : bool, optional
+        Whether to perform the compression inplace or not.
+    compress_opts
+        Supplied to :func:`~quimb.tensor.tensor_split`.
+    
+    Returns
+    -------
+    DownTensorNetwork, UpTensorNetwork
+        The compressed down and up tensor networks, with canonical center at
+        ``down_site_tags[0]`` ('right canonical' form) or ``up_site_tags[0]`` ('left
+        canonical' form) if ``sweep_reverse``.
+    """
+
+    if not canonize:
+        warnings.warn("`canonize=False` is ignored for the `tm` method.")
+
+    if down_site_tags is None:
+        down_site_tags = down_tn.site_tags
+    if up_site_tags is None:
+        up_site_tags = up_tn.site_tags
+
+    # NOTE during the compression need to use one site_tags for both tn, 
+    # but before returning need to restore the down_site_tags and up_site_tags for each tn
+    site_tags = down_site_tags 
+
+    if sweep_reverse:
+        site_tags = tuple(reversed(site_tags))
+    
+    if len(down_tn.site_tags) != len(up_tn.site_tags):
+        raise ValueError("`down_tn.site_tags` and `up_tn.site_tags` must have the same length.")
+    if len(down_site_tags) != len(up_site_tags):
+        raise ValueError("`down_site_tags` and `up_site_tags` must have the same length.")
+
+    N = len(site_tags)
+
+    up_ket = enforce_1d_like(up_tn, site_tags=site_tags, inplace=inplace)
+    down_bra = enforce_1d_like(down_tn, site_tags=site_tags, inplace=inplace)
+
+    # partition outer indices, and create conjugate bra indices
+    up_ket_site_inds = []
+    down_bra_site_inds = []
+    ketbra_indmap = {}
+    for tag in site_tags:
+        u_k_inds_i = []
+        d_b_inds_i = []
+        for ukix in up_ket.select(tag)._outer_inds & up_ket._outer_inds:
+            dbix = rand_uuid() # NOTE what is this?
+            u_k_inds_i.append(ukix)
+            d_b_inds_i.append(dbix)
+            ketbra_indmap[ukix] = dbix
+        up_ket_site_inds.append(tuple[Any, ...](u_k_inds_i))
+        down_bra_site_inds.append(tuple[Any, ...](d_b_inds_i))
+
+    # doing this means forming the norm doesn't do its own mangling
+    down_bra.mangle_inner_()
+    # form the overlapping double layer TN
+    norm = down_bra & up_ket
+    # open the bra's indices back up
+    down_bra.reindex_(ketbra_indmap)
+
+    # construct dense down environments
+    # (n.b. K, B generally *collection* of tensors)
+    #
+    #     K══K══K══K══            ╔═K══          ╔═
+    #     │  │  │  │       ->    LE │     = ... LE
+    #     B══B══B══B══            ╚═B══          ╚═
+    #     0  1  2  3            i-1 i            i
+    #
+    left_envs = {}
+    left_envs[1] = norm.select(site_tags[0]).contract(
+        preserve_tensor=True,
+        drop_tags=True,
+        optimize=optimize,
+    )
+    for i in range(2, N):
+        left_envs[i] = tensor_contract(
+            left_envs[i - 1],
+            *norm.select_tensors(site_tags[i - 1]),
+            preserve_tensor=True,
+            drop_tags=True,
+            optimize=optimize,
+        )
+
+    # build projectors and right environments
+    Us = [None] * N
+    VDs = [None] * N
+    right_env_ket = None
+    right_env_bra = None
+    new_bonds = collections.defaultdict(rand_uuid)
+
+    for i in range(N - 1, 0, -1):
+        # form the reduced density matrix
+        #
+        #                          ket_site_inds[i]
+        #          │   ┃           :  new_bonds["k", i + 1]
+        #       ╔══K══REk          │  ┃
+        #      LE            =>    rhoi
+        #       ╚══B══REb          │  ┃
+        #          │   ┃           :  new_bonds["b", i + 1]
+        #                          bra_site_inds[i]
+        #     i-1  i  i+1
+        #
+        rho_tensors = [
+            left_envs[i],
+            *up_ket.select_tensors(site_tags[i]),
+            *down_bra.select_tensors(site_tags[i]),
+        ]
+        left_inds = list(up_ket_site_inds[i])
+        right_inds = list(down_bra_site_inds[i])
+        if right_env_ket is not None:
+            rho_tensors.extend([right_env_ket, right_env_bra])
+            left_inds.append(new_bonds["k", i + 1])
+            right_inds.append(new_bonds["b", i + 1])
+
+        # NOTE below is the key part different with dm method
+
+        # contract and then split it
+        #
+        #                    │  ┃
+        #     │  ┃           UUUU
+        #     │  ┃            ┃
+        #     rhoi    =>      s    ... dbix, with size max_bond
+        #     │  ┃            ┃
+        #     │  ┃           VDVD
+        #                    │  ┃
+        #
+        rhoi = tensor_contract(
+            *rho_tensors,
+            preserve_tensor=True,
+            optimize=optimize,
+        )
+        U, s, VD = rhoi.split(
+            left_inds=left_inds,
+            right_inds=right_inds,
+            method="svd", # NOTE here we use svd instead of eigh
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            get="tensors",
+            absorb=None,
+            **compress_opts,
+        )    
+
+        # turn bond into 'virtual right' indices
+        #
+        #     │  ┃
+        #     UUUU
+        #      ┃   ...new_bonds["k", i]
+        #     ✂
+        #      ┃   ...new_bonds["b", i]
+        #     VDVD
+        #     │  ┃
+        #
+        (dbix,) = s.inds
+        ## NOTE check below, we are using dbix but no ukix?
+        U.reindex_({dbix: new_bonds["k", i]})
+        VD.reindex_({dbix: new_bonds["b", i]})
+        Us[i] = U
+        VDs[i] = VD
+
+        # attach the unitaries to the right environments and contract
+        #
+        #         ┃
+        #       UUUUU†             new_bonds["k", i]
+        #       │   ┃     =>       ┃
+        #     ══K══REk          ══REk
+        #
+        #       i   i+1            i
+        #
+        #     ══B══REb          ══REb
+        #       │   ┃     =>       ┃
+        #       UHUHU†             new_bonds["b", i]
+        #         ┃
+        #
+        # NOTE: is this correct to contract U.H and VD.H like this?
+        right_ket_tensors = [*up_ket.select_tensors(site_tags[i]), U.H]
+        right_bra_tensors = [*down_bra.select_tensors(site_tags[i]), VD.H]
+        if right_env_ket is not None:
+            # we have already done one move -> have right envs
+            right_ket_tensors.append(right_env_ket)
+            right_bra_tensors.append(right_env_bra)
+
+        right_env_ket = tensor_contract(
+            *right_ket_tensors,
+            preserve_tensor=True,
+            drop_tags=True,
+            optimize=optimize,
+        )
+        # TODO: could compute this just as conjugated and relabelled ket env
+        right_env_bra = tensor_contract(
+            *right_bra_tensors,
+            preserve_tensor=True,
+            drop_tags=True,
+            optimize=optimize,
+        )
+
+    # form the final site
+    #
+    #     │   ┏━━         │
+    #     K══REk     =    U━━
+    #     0   1           0
+    #
+    Us[0] = tensor_contract(
+        *up_ket.select_tensors(site_tags[0]),
+        right_env_ket,
+        optimize=optimize,
+        preserve_tensor=True,
+    )
+    # NOTE is this correct?
+    VDs[0] = tensor_contract(
+        *down_bra.select_tensors(site_tags[0]),
+        right_env_bra,
+        optimize=optimize,
+        preserve_tensor=True,
+    )
+
+    # NOTE is this correct to put VD and U like this?
+    down_tn_new = _form_final_tn_from_tensor_sequence(
+        down_tn,
+        VDs,
+        normalize,
+        sweep_reverse,
+        permute_arrays,
+        equalize_norms,
+        inplace,
+    )
+    up_tn_new = _form_final_tn_from_tensor_sequence(
+        up_tn,
+        Us,
+        normalize,
+        sweep_reverse,
+        permute_arrays,
+        equalize_norms,
+        inplace,
+    )
+    # NOTE where to restore the down_site_tags and up_site_tags for each tn?
+
+    return down_tn_new, up_tn_new
+
 
 def tensor_network_1d_compress_zipup(
     tn,
