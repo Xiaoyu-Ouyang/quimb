@@ -160,6 +160,7 @@ from .tensor_core import (
 from .tn1d.compress import (
     enforce_1d_like,
     tensor_network_1d_compress,
+    tensor_network_1d_compress_tm,
 )
 from .tn1d.core import (
     Dense1D,
@@ -361,6 +362,7 @@ __all__ = (
     "tensor_fuse_squeeze",
     "tensor_linop_backend",
     "tensor_network_1d_compress",
+    "tensor_network_1d_compress_tm",
     "tensor_network_ag_gate_simple",
     "tensor_network_ag_gate",
     "tensor_network_ag_sum",
